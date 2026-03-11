@@ -21,3 +21,9 @@ env/
 # IDEs
 .idea/
 .vscode/
+
+# Test scripts
+test_*.py
+
+# Raw docs
+gemini_api.md

@@ -163,56 +163,123 @@ def shutdown_event():
     observer.stop()
     observer.join()
 
-@app.post("/v1/{path:path}")
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(path: str, request: Request):
+    # Detect version and base path
+    # If the user sends /v1/chat/completions -> path is "v1/chat/completions"
+    # If the user sends /v1beta/models/... -> path is "v1beta/models/..."
+    
+    full_path = path
     body_bytes = await request.body()
+    
+    # Filter headers to avoid duplicates and conflicts
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "authorization",
-                              "x-goog-api-key", "connection")
+                              "x-goog-api-key", "connection", "accept-encoding")
     }
-    headers["content-type"] = "application/json"
-
+    
     is_streaming = False
     try:
-        is_streaming = json.loads(body_bytes).get("stream", False)
+        if body_bytes:
+            is_streaming = json.loads(body_bytes).get("stream", False)
     except Exception:
         pass
 
-    key = store.get_key()
-    if not key:
-        return JSONResponse({"error": "All keys exhausted. Try again shortly."}, status_code=429)
-    headers["Authorization"] = f"Bearer {key}"
-    target = f"{GEMINI_BASE_URL}/{path}"
-    logger.info(f"→ ...{key[-8:]} | {path}")
+    # Determine Routing Mode
+    # Strip any client-added /v1/, /v1beta/, or /openai/ to get the base operation
+    normalized_path = full_path.lstrip("/")
+    if normalized_path.startswith("v1/"):
+        normalized_path = normalized_path[3:]
+    elif normalized_path.startswith("v1beta/"):
+        normalized_path = normalized_path[7:]
+    if normalized_path.startswith("openai/"):
+        normalized_path = normalized_path[7:]
+        
+    # Check headers to aggressively identify native Google GenAI SDKs vs OpenAI SDKs
+    is_native = ("x-goog-api-key" in request.headers or 
+                 "x-goog-api-client" in request.headers)
+                 
+    if not is_native:
+        if "chat/completions" in normalized_path or "embeddings" in normalized_path:
+            is_native = False
+        elif ":" in normalized_path:
+            is_native = True
+        elif "authorization" in request.headers:
+            is_native = False
+        else:
+            is_native = "models/" in normalized_path
+
+    if is_native:
+        target = f"https://generativelanguage.googleapis.com/v1beta/{normalized_path}"
+    else:
+        target = f"https://generativelanguage.googleapis.com/v1beta/openai/{normalized_path}"
+
+    def get_and_attach_key(current_headers: dict):
+        key = store.get_key()
+        if not key:
+            return None, None
+        
+        if is_native:
+            current_headers["x-goog-api-key"] = key
+            current_headers.pop("Authorization", None)
+        else:
+            current_headers["Authorization"] = f"Bearer {key}"
+            current_headers.pop("x-goog-api-key", None)
+            
+        return key, current_headers
 
     try:
+        key, headers = get_and_attach_key(headers)
+        if not key:
+            return JSONResponse({"error": "All keys exhausted. Try again shortly."}, status_code=429)
+
+        logger.info(f"→ ...{key[-8:]} | {full_path} | Native: {is_native}")
+
         if is_streaming:
-            return await stream_response(target, headers, body_bytes, key)
+            return await stream_response(target, headers, body_bytes, key, is_native)
 
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            r = await client.post(target, headers=headers, content=body_bytes)
+            r = await client.request(
+                method=request.method,
+                url=target,
+                headers=headers,
+                content=body_bytes
+            )
 
+        # Basic 429 Retry
         if r.status_code == 429:
             store.mark_exhausted(key)
-            key2 = store.get_key()
-            if not key2:
+            key2, headers2 = get_and_attach_key(headers.copy())
+            if not key2 or not headers2:
                 return JSONResponse({"error": "All keys exhausted"}, status_code=429)
-            headers["Authorization"] = f"Bearer {key2}"
+            
             async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-                r = await client.post(target, headers=headers, content=body_bytes)
+                r = await client.request(
+                    method=request.method,
+                    url=target,
+                    headers=headers2,
+                    content=body_bytes
+                )
+            key = key2 # for logging
 
-        logger.info(f"✓ ...{key[-8:]} | {r.status_code}")
-        return JSONResponse(content=r.json(), status_code=r.status_code)
+        logger.info(f"✓ ...{key[-8:] if key else '????'} | {r.status_code}")
+        
+        # Return response as is
+        try:
+            return JSONResponse(content=r.json(), status_code=r.status_code)
+        except Exception:
+            return JSONResponse(content=r.text, status_code=r.status_code)
 
     except httpx.TimeoutException:
-        store.mark_exhausted(key)
+        if 'key' in locals() and key:
+            store.mark_exhausted(key)
         return JSONResponse({"error": "Request timed out"}, status_code=504)
     except Exception as e:
         logger.error(f"Error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
-async def stream_response(url: str, headers: dict, body: bytes, key: str):
+async def stream_response(url: str, headers: dict, body: bytes, key: str, is_native: bool):
     async def gen():
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             async with client.stream("POST", url, headers=headers, content=body) as r:
